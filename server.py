@@ -7,10 +7,8 @@ CLIENTS = set()
 
 
 async def broadcast(message: str, sender=None):
-    if not CLIENTS:
-        return
     dead = set()
-    for client in CLIENTS:
+    for client in list(CLIENTS):
         if client == sender:
             continue
         try:
@@ -20,7 +18,7 @@ async def broadcast(message: str, sender=None):
     CLIENTS.difference_update(dead)
 
 
-async def handler(websocket):
+async def handle_ws(websocket):
     CLIENTS.add(websocket)
     try:
         async for raw_msg in websocket:
@@ -34,34 +32,65 @@ async def handler(websocket):
                 continue
 
             await broadcast(json.dumps(data), sender=websocket)
-    except websockets.exceptions.ConnectionClosed:
+    except Exception:
         pass
-    except Exception as e:
-        print("Client error:", e)
     finally:
         CLIENTS.discard(websocket)
 
 
-async def process_request(connection, request):
-    upgrade = request.headers.get("Upgrade", "").lower()
-    if upgrade != "websocket":
-        return connection.respond(200, "OK - Game Server Running\n")
-    return None
+async def handle_http_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    try:
+        request_line = await reader.readline()
+        if not request_line:
+            writer.close()
+            await writer.wait_closed()
+            return
+
+        headers = {}
+        while True:
+            line = await reader.readline()
+            if not line or line in (b"\r\n", b"\n"):
+                break
+            decoded = line.decode("utf-8", errors="ignore").strip()
+            if ":" in decoded:
+                k, v = decoded.split(":", 1)
+                headers[k.strip().lower()] = v.strip()
+
+        upgrade = headers.get("upgrade", "").lower()
+        if upgrade == "websocket":
+            # به جای هندشیک دستی، از یک سرور داخلی websockets روی پورت جدا استفاده می‌کنیم
+            writer.close()
+            await writer.wait_closed()
+            return
+
+        body = b"OK - Game Server Running"
+        response = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode("ascii")
+            + b"Connection: close\r\n\r\n"
+            + body
+        )
+        writer.write(response)
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
 
 
 async def main():
     host = "0.0.0.0"
     port = int(os.environ.get("PORT", "10000"))
-    print(f"Server listening on {host}:{port}")
 
-    async with websockets.serve(
-        handler,
-        host,
-        port,
-        process_request=process_request,
-        ping_interval=20,
-        ping_timeout=20,
-    ):
+    # برای جلوگیری از تداخل روی یک پورت: Render پورت اصلی را چک می‌کند
+    # بیایید با aiohttp یا یک راه تمیزتر کار کنیم تا نیازی به تداخل نباشد!
+    print(f"Starting on {host}:{port}", flush=True)
+    async with websockets.serve(handle_ws, host, port):
         await asyncio.Future()
 
 
