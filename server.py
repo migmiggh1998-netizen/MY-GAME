@@ -1,7 +1,12 @@
 """OxideX game server - WebSocket relay for Render (Python 3, standard library only).
 
 One room per map, max 10 players per room. Player saves are kept in memory
-(they are lost when the server restarts). Clients connect with wss://my-game-d6ay.onrender.com
+(they are lost when the server restarts). Player names are unique and are stored
+in a GitHub file, so they survive restarts. Environment variables for that:
+  GITHUB_TOKEN  fine-grained token with "Contents: Read and write" on one repository
+  GITHUB_REPO   owner/repository
+  GITHUB_BRANCH (optional, default main)
+Clients connect with wss://my-game-d6ay.onrender.com
 Open the same address in a browser (https) to see the player count.
 """
 import asyncio
@@ -12,6 +17,8 @@ import math
 import os
 import re
 import struct
+import urllib.error
+import urllib.request
 
 PORT = int(os.environ.get("PORT", "10000"))
 MAX_PLAYERS = 10
@@ -19,12 +26,144 @@ MAX_CONNECTIONS = 40
 MAX_SAVES = 2000
 SERVER_NAME = "OxideX Official"
 MAX_PAYLOAD = 8192
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip().strip("/")
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip()
+GITHUB_API = os.environ.get("GITHUB_API", "https://api.github.com")
+NAMES_PATH = "data/names.json"
+MAX_NAMES = 8000
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 players = {}  # id -> Client
 saves = {}    # (map, device id) -> save data
 connections = 0
 next_id = 1
+
+
+# ---------------------------------------------------------------- unique names
+
+names = {}          # lower case name -> {"name": shown name, "owner": hashed device id}
+names_loaded = False
+names_status = "memory only (GITHUB_TOKEN / GITHUB_REPO not set)"
+names_sha = None
+names_dirty = None  # asyncio.Event, created in main()
+
+
+def github_enabled():
+    return bool(GITHUB_TOKEN and GITHUB_REPO)
+
+
+def github_request(method, url, body=None):
+    req = urllib.request.Request(
+        GITHUB_API + url, method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Authorization": "Bearer " + GITHUB_TOKEN, "Accept": "application/vnd.github+json",
+                 "User-Agent": "oxidex-server", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as res:
+        return json.loads(res.read().decode("utf-8"))
+
+
+def github_read():
+    """returns (names, sha); ({}, None) if the file does not exist yet"""
+    try:
+        res = github_request("GET", f"/repos/{GITHUB_REPO}/contents/{NAMES_PATH}?ref={GITHUB_BRANCH}")
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+        # 404 can also mean a wrong repository name or token: check the repository and branch
+        github_request("GET", f"/repos/{GITHUB_REPO}/branches/{GITHUB_BRANCH}")
+        return {}, None
+    data = json.loads(base64.b64decode(res["content"]).decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("names file is not valid")
+    return data, res["sha"]
+
+
+def github_write(text, sha):
+    body = {"message": "[skip render] update player names", "branch": GITHUB_BRANCH,
+            "content": base64.b64encode(text.encode("utf-8")).decode()}
+    if sha:
+        body["sha"] = sha
+    res = github_request("PUT", f"/repos/{GITHUB_REPO}/contents/{NAMES_PATH}", body)
+    return res["content"]["sha"]
+
+
+def merge_names(remote):
+    """keep our newer entries, add the remote ones we do not know"""
+    owners = {v["owner"] for v in names.values()}
+    for key, value in remote.items():
+        if key not in names and value.get("owner") not in owners:
+            names[key] = value
+
+
+async def load_names():
+    global names_loaded, names_sha, names_status
+    try:
+        remote, names_sha = await asyncio.to_thread(github_read)
+        merge_names(remote)
+        names_loaded = True
+        names_status = "saved on GitHub"
+        print(f"Names loaded from GitHub: {len(names)}", flush=True)
+    except Exception as e:
+        names_status = f"GitHub error: {e}"
+        print("Could not load names:", e, flush=True)
+
+
+async def names_worker():
+    global names_sha, names_status
+    while not names_loaded:
+        await asyncio.sleep(15)
+        await load_names()
+    while True:
+        await names_dirty.wait()
+        await asyncio.sleep(2)
+        names_dirty.clear()
+        text = json.dumps(names, ensure_ascii=False, indent=1, sort_keys=True)
+        try:
+            names_sha = await asyncio.to_thread(github_write, text, names_sha)
+            names_status = "saved on GitHub"
+        except Exception as e:
+            names_status = f"GitHub error: {e}"
+            print("Could not save names:", e, flush=True)
+            await asyncio.sleep(10)
+            try:  # the file may have changed: read it again, then retry
+                remote, names_sha = await asyncio.to_thread(github_read)
+                merge_names(remote)
+            except Exception:
+                pass
+            names_dirty.set()
+
+
+def owner_of(device):
+    return hashlib.sha256(device.encode()).hexdigest()
+
+
+def claim_name(raw, device):
+    """returns (ok, reason, name)"""
+    name = " ".join(str(raw or "").split())
+    if not re.fullmatch(r"[A-Za-z0-9_\- ]{3,16}", name):
+        return False, "Use 3-16 English letters or numbers", name
+    key = name.lower()
+    if key == "player":
+        return False, "Choose another name", name
+    if not device:
+        return False, "Update the game", name
+    if github_enabled() and not names_loaded:
+        return False, "Server is starting, try again", name
+    owner = owner_of(device)
+    old = names.get(key)
+    if old and old["owner"] != owner:
+        return False, "Name is already taken", name
+    if old and old["name"] == name:
+        return True, "", name
+    for other in [k for k, v in names.items() if v["owner"] == owner]:
+        del names[other]  # one name per phone: the old one becomes free
+    if len(names) >= MAX_NAMES:
+        return False, "Name list is full", name
+    names[key] = {"name": name, "owner": owner}
+    if names_dirty is not None:
+        names_dirty.set()
+    return True, "", name
 
 
 class Client:
@@ -144,9 +283,23 @@ def handle_message(client, text):
         return
     t = msg.get("t")
 
+    if t == "register" and client.id == 0:
+        ok, reason, name = claim_name(msg.get("name"), clean_key(msg.get("device"), ""))
+        client.send({"t": "register_result", "ok": ok, "reason": reason, "name": name})
+        client.close()
+        return
+
     if t == "join" and client.id == 0:
         room = clean_key(msg.get("map"), "world")
         device = clean_key(msg.get("device"), "")
+        wanted = " ".join(str(msg.get("name") or "").split())
+        taken = names.get(wanted.lower())
+        if taken and (not device or taken["owner"] != owner_of(device)):
+            client.send({"t": "name_taken"})
+            client.close()
+            return
+        if not taken and device:
+            claim_name(wanted, device)
         # the same phone came back while its old connection is still open
         if device:
             for old in list(players.values()):
@@ -246,7 +399,8 @@ async def http_reply(writer, method, path):
     if path.split("?")[0] == "/health":
         body, ctype = b"ok", "text/plain"
     else:
-        body = json.dumps({"name": SERVER_NAME, "players": len(players), "max": MAX_PLAYERS}).encode()
+        body = json.dumps({"name": SERVER_NAME, "players": len(players), "max": MAX_PLAYERS,
+                           "names": len(names), "name_storage": names_status}).encode()
         ctype = "application/json"
     head = (f"HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\n"
             f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode()
@@ -286,6 +440,12 @@ async def handle(reader, writer):
 
 
 async def main():
+    global names_dirty
+    names_dirty = asyncio.Event()
+    worker = None
+    if github_enabled():
+        await load_names()
+        worker = asyncio.create_task(names_worker())  # keep a reference to the task
     server = await asyncio.start_server(handle, "0.0.0.0", PORT)
     print(f"OxideX server running on port {PORT} (max {MAX_PLAYERS} players)", flush=True)
     async with server:
@@ -294,4 +454,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-                      
