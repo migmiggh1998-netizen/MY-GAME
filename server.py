@@ -1,7 +1,7 @@
 """OxideX game server - WebSocket relay for Render (Python 3, standard library only).
 
-Max 10 players PER ROOM. One room per map (client sends "map" in join).
-Players in the same room see each other. Clients connect with wss://my-game-d6ay.onrender.com
+One room per map, max 10 players per room. Player saves are kept in memory
+(they are lost when the server restarts). Clients connect with wss://my-game-d6ay.onrender.com
 Open the same address in a browser (https) to see the player count.
 """
 import asyncio
@@ -16,12 +16,13 @@ import struct
 PORT = int(os.environ.get("PORT", "10000"))
 MAX_PLAYERS = 10
 MAX_CONNECTIONS = 40
+MAX_SAVES = 2000
 SERVER_NAME = "OxideX Official"
-MAX_PAYLOAD = 4096
+MAX_PAYLOAD = 8192
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-DEFAULT_MAP = "world"
-rooms = {}  # map name -> {player id: Client}
+players = {}  # id -> Client
+saves = {}    # (map, device id) -> save data
 connections = 0
 next_id = 1
 
@@ -31,8 +32,9 @@ class Client:
         self.writer = writer
         self.id = 0
         self.name = ""
+        self.map = "world"
+        self.device = ""
         self.state = None
-        self.room = ""
         self.closed = False
 
     def send_text(self, text):
@@ -87,19 +89,10 @@ async def read_frame(reader):
     return fin, opcode, data
 
 
-def total_players():
-    return sum(len(r) for r in rooms.values())
-
-
-def clean_map(raw):
-    m = re.sub(r"[^a-z0-9_]", "", str(raw or DEFAULT_MAP).lower())
-    return (m or DEFAULT_MAP)[:16]
-
-
-def broadcast(room, obj, except_id=0):
+def broadcast(obj, room, except_id=0):
     text = json.dumps(obj, separators=(",", ":"))
-    for pid, c in list((rooms.get(room) or {}).items()):
-        if pid != except_id:
+    for pid, c in list(players.items()):
+        if c.map == room and pid != except_id:
             c.send_text(text)
 
 
@@ -119,39 +112,72 @@ def num_list(a, length):
     return out
 
 
+def clean_key(raw, fallback):
+    k = re.sub(r"[^A-Za-z0-9_\-]", "", str(raw or ""))[:64]
+    return k or fallback
+
+
+def remove_player(client):
+    if client.id and players.get(client.id) is client:
+        del players[client.id]
+        broadcast({"t": "left", "id": client.id}, client.map)
+        print(f"- {client.name} (#{client.id}) left {client.map}.", flush=True)
+
+
+def store_save(client, data):
+    if not client.device or not isinstance(data, dict):
+        return
+    key = (client.map, client.device)
+    saves.pop(key, None)
+    saves[key] = data
+    while len(saves) > MAX_SAVES:
+        del saves[next(iter(saves))]  # forget the oldest one
+
+
 def handle_message(client, text):
     global next_id
     try:
         msg = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
         return
     if not isinstance(msg, dict):
         return
     t = msg.get("t")
 
     if t == "join" and client.id == 0:
-        room_name = clean_map(msg.get("map"))
-        room = rooms.setdefault(room_name, {})
-        if len(room) >= MAX_PLAYERS:
-            if not room:
-                del rooms[room_name]
+        room = clean_key(msg.get("map"), "world")
+        device = clean_key(msg.get("device"), "")
+        # the same phone came back while its old connection is still open
+        if device:
+            for old in list(players.values()):
+                if old.device == device and old.map == room:
+                    remove_player(old)
+                    old.send({"t": "replaced"})
+                    old.close()
+        if sum(1 for c in players.values() if c.map == room) >= MAX_PLAYERS:
             client.send({"t": "full"})
             client.close()
             return
         pid = next_id
         next_id += 1
         client.id = pid
-        client.room = room_name
+        client.map = room
+        client.device = device
         client.name = clean_name(msg.get("name"))
-        room[pid] = client
-        others = [{"id": i, "name": c.name, "state": c.state} for i, c in room.items() if i != pid]
+        others = [{"id": i, "name": c.name, "state": c.state} for i, c in players.items() if c.map == room]
+        players[pid] = client
         client.send({"t": "welcome", "id": pid, "name": SERVER_NAME, "max": MAX_PLAYERS,
-                     "map": room_name, "players": others})
-        broadcast(room_name, {"t": "joined", "id": pid, "name": client.name}, pid)
-        print(f"+ {client.name} (#{pid}) joined [{room_name}]. Room: {len(room)}/{MAX_PLAYERS}", flush=True)
+                     "players": others, "save": saves.get((room, device)) if device else None})
+        broadcast({"t": "joined", "id": pid, "name": client.name}, room, pid)
+        count = len(others) + 1
+        print(f"+ {client.name} (#{pid}) joined {room}. Players: {count}/{MAX_PLAYERS}", flush=True)
         return
 
-    if client.id == 0:
+    if client.id == 0 or players.get(client.id) is not client:
+        return
+
+    if t == "save":
+        store_save(client, msg.get("data"))
         return
 
     if t == "state":
@@ -163,7 +189,7 @@ def handle_message(client, text):
         if isinstance(a, bool) or not isinstance(a, (int, float)) or not math.isfinite(a):
             a = 0
         client.state = {"p": pos, "r": rot, "a": a}
-        broadcast(client.room, {"t": "state", "id": client.id, "p": pos, "r": rot, "a": a}, client.id)
+        broadcast({"t": "state", "id": client.id, "p": pos, "r": rot, "a": a}, client.map, client.id)
 
 
 async def pinger(client):
@@ -212,13 +238,7 @@ async def ws_session(reader, writer, key):
         pass
     finally:
         ping_task.cancel()
-        room = rooms.get(client.room)
-        if client.id and room is not None and room.get(client.id) is client:
-            del room[client.id]
-            broadcast(client.room, {"t": "left", "id": client.id})
-            print(f"- {client.name} (#{client.id}) left [{client.room}]. Room: {len(room)}/{MAX_PLAYERS}", flush=True)
-            if not room:
-                del rooms[client.room]
+        remove_player(client)
         client.close()
 
 
@@ -226,8 +246,7 @@ async def http_reply(writer, method, path):
     if path.split("?")[0] == "/health":
         body, ctype = b"ok", "text/plain"
     else:
-        body = json.dumps({"name": SERVER_NAME, "players": total_players(), "max": MAX_PLAYERS,
-                            "rooms": {k: len(v) for k, v in rooms.items()}}).encode()
+        body = json.dumps({"name": SERVER_NAME, "players": len(players), "max": MAX_PLAYERS}).encode()
         ctype = "application/json"
     head = (f"HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\n"
             f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode()
@@ -275,3 +294,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+                      
