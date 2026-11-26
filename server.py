@@ -138,6 +138,26 @@ def owner_of(device):
     return hashlib.sha256(device.encode()).hexdigest()
 
 
+def migrate_device(device, legacy):
+    """an old random id (kept in a file on the phone) moves its name and save to the new device id"""
+    if not device or not legacy or device == legacy:
+        return
+    if github_enabled() and not names_loaded:
+        return
+    old_owner = owner_of(legacy)
+    new_owner = owner_of(device)
+    if not any(v["owner"] == new_owner for v in names.values()):
+        for v in names.values():
+            if v["owner"] == old_owner:
+                v["owner"] = new_owner
+                if names_dirty is not None:
+                    names_dirty.set()
+                break
+    for key in [k for k in saves if k[1] == legacy]:
+        if (key[0], device) not in saves:
+            saves[(key[0], device)] = saves.pop(key)
+
+
 def claim_name(raw, device):
     """returns (ok, reason, name)"""
     name = " ".join(str(raw or "").split())
@@ -283,15 +303,39 @@ def handle_message(client, text):
         return
     t = msg.get("t")
 
+    if t == "whoami" and client.id == 0:
+        device = clean_key(msg.get("device"), "")
+        migrate_device(device, clean_key(msg.get("legacy"), ""))
+        if github_enabled() and not names_loaded:
+            client.send({"t": "whoami_result", "wait": True})
+        else:
+            found = ""
+            if device:
+                owner = owner_of(device)
+                for v in names.values():
+                    if v["owner"] == owner:
+                        found = v["name"]
+                        break
+            client.send({"t": "whoami_result", "name": found})
+        client.close()
+        return
+
     if t == "register" and client.id == 0:
+        migrate_device(clean_key(msg.get("device"), ""), clean_key(msg.get("legacy"), ""))
         ok, reason, name = claim_name(msg.get("name"), clean_key(msg.get("device"), ""))
         client.send({"t": "register_result", "ok": ok, "reason": reason, "name": name})
+        client.close()
+        return
+
+    if t == "ping" and client.id == 0:
+        client.send({"t": "pong", "players": len(players), "max": MAX_PLAYERS})
         client.close()
         return
 
     if t == "join" and client.id == 0:
         room = clean_key(msg.get("map"), "world")
         device = clean_key(msg.get("device"), "")
+        migrate_device(device, clean_key(msg.get("legacy"), ""))
         wanted = " ".join(str(msg.get("name") or "").split())
         taken = names.get(wanted.lower())
         if taken and (not device or taken["owner"] != owner_of(device)):
